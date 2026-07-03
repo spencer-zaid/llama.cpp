@@ -146,8 +146,11 @@ the fused op instead of the original permute/mul_mat/relu/mul/sum_rows
 sequence.
 
 **Correctness:** verified token-identical greedy output against the
-unfused path at short context, and via a needle-in-haystack retrieval
-test at long context (see Results).
+unfused path at short context (before real top-k filtering kicks in),
+a needle-in-haystack retrieval test at long context, and KL-divergence/
+perplexity against the naive path at real context depths - see Results
+for the full picture, including a small, understood, and expected
+source of non-bit-identical output at the top-k selection boundary.
 
 ## Test hardware
 
@@ -236,6 +239,54 @@ The 50% (hardest) depth was also spot-checked at the 512K and 1M
 presets, both correct: 512K - 256.0 t/s prefill, 13.7 t/s decode; 1M -
 158.6 t/s prefill, 13.7 t/s decode.
 
+### Correctness: KL-divergence / perplexity
+
+Needle-in-haystack proves retrieval correctness, not full-distribution
+numerical fidelity - it only checks whether one planted fact survives,
+not whether every token's output distribution matches the unfused path.
+Ran `llama-perplexity --kl-divergence` (llama.cpp's standard tool for
+this, also used to validate quantizations) comparing this kernel against
+the naive/unfused path on wikitext-2, at two context depths:
+
+| Context | Tokens | Mean KLD | Median KLD | Same top-token | Max single-token Δp |
+|---------|--------|----------|------------|-----------------|----------------------|
+| 8,192   | 16,384 | 0.0108   | 0.0026     | 96.12%           | 31.5%                 |
+| 65,536  | 65,536 | 0.0092   | 0.0029     | 96.33%           | 72.8%                 |
+
+This is **not bit-identical** to the naive path, and it's worth being
+upfront about why. The indexer does a hard top-k=512 selection over all
+candidate KV positions. Naive computes the selection score via a chain
+of separate ops (permute -> mul_mat -> relu -> mul -> sum_rows); this
+kernel computes the same value in one warp-parallel reduction. Both are
+correct, but floating-point addition isn't associative, so summing in a
+different order produces a tiny (~0.01-0.1% relative) difference in the
+score - invisible almost everywhere, except for the handful of
+candidates sitting right at the top-512 cutoff. There, a margin smaller
+than that rounding noise decides who's rank 512 and who's rank 513, so
+the two implementations occasionally disagree on that one boundary case.
+
+Confirmed this directly by dumping the raw per-position indexer scores
+and the selected top-512 index sets from both builds at a real
+(>512-candidate) context. Of 353 query positions, 67 (19%) had their
+selection affected - and **every single one was a clean 1-for-1 index
+swap**, never a larger or systematic difference. In each case the two
+swapped candidates' scores were within 0.0001-0.001 of each other in
+both builds independently, confirming a genuine near-tie rather than a
+logic error - a real bug (wrong masking, an off-by-one, a missed
+Hadamard rotation step) would show up as large or structurally
+consistent differences, not scattered single-index coin-flips on
+already near-tied candidates.
+
+A single-position swap at one layer is a small perturbation on its own,
+but it happens independently at every layer that runs the indexer, so
+the effect compounds - and occasionally the swapped-in/out position
+happens to matter a lot for that specific prediction, producing the
+larger Δp outliers in the table above. This is the same category of
+thing as llama.cpp's flash-attention kernels producing slightly
+different logits than naive attention: expected, precedented, and not
+fixable by further kernel debugging, since both code paths are
+mathematically correct.
+
 ### Throughput vs. how full the context already is (256K preset)
 
 Prefill speed for the next 2048 tokens, measured at increasing KV depth
@@ -280,6 +331,12 @@ via more CPU-DDR bandwidth pressure).
 
 ## Known limitations
 
+- Not bit-identical to the naive/unfused path at real context depths
+  (~4% of tokens pick a different top token in KL-divergence testing).
+  Confirmed via direct score inspection to be floating-point rounding
+  noise at the top-k=512 selection boundary (different reduction order
+  between this kernel and naive's multi-op chain), not a logic bug -
+  see Correctness: KL-divergence / perplexity.
 - F16 KV cache only - quantized KV is broken upstream without PR #25202,
   which isn't included here. Cache is pretty small on deepseek v4 anyways
 - Only tested on a single RTX 5090. Other GPUs/VRAM sizes will need their
